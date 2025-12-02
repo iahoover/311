@@ -1,0 +1,235 @@
+// stuff from project 2
+unsigned long previousMillisLED1 = 0;
+unsigned long previousMillisLED2 = 0;
+int intervalLED1 = 1000; // default interval
+int intervalLED2 = 1000; // default interval
+bool led1State = false;  // track LED states
+bool led2State = false;
+bool waitingForInput = true; // to manage the prompts
+int currentLED = 0;          // to manage which LED the user is configuring
+
+// for motor/PWM/button state 
+#include <avr/interrupt.h>
+
+const uint8_t MOTOR_PIN  = 3;  // PWM output to motor driver / LED
+const uint8_t BUTTON_PIN = 2;  // push button to GND, uses INPUT_PULLUP
+
+// PWM state 
+volatile uint8_t pwmDuty    = 0;  // 0..255
+volatile uint8_t pwmCounter = 0;  // 0..255
+
+// Button debouncing
+const unsigned long DEBOUNCE_MS = 30;
+
+bool          btnStablePressed  = false; // debounced 
+bool          btnLastRawPressed = false; // last raw sample
+unsigned long btnLastChangeMs   = 0;     // last time raw state changed
+
+// duty-cycle sequence state
+// corresponds to 0, 2/8, 4/8, 6/8, 8/8, 6/8, 4/8, 2/8, 0
+const uint8_t dutyLevelIndexSeq[9] = {0, 1, 2, 3, 4, 3, 2, 1, 0};
+uint8_t       currentSeqPos = 0; 
+
+// duty cycles
+// 0 maps to 0/8  
+// 1 maps to 2/8  
+// 2 maps to 4/8  
+// 3 maps to 6/8  
+// 4 maps to 8/8  
+const uint8_t dutyLevels[5] = {
+  0,    // 0/8
+  64,   // 2/8
+  128,  // 4/8
+  191,  // 6/8
+  255   // 8/8
+};
+
+// tasks
+void taskSerial();   // input logic from project 2
+void taskLED1();     // LED1 timing logic
+void taskLED2();     // LED2 timing logic
+void taskButton();   // button
+
+// Support functions for new functionality
+void setupTimer2ForSoftwarePWM();
+void handleDebouncedButtonPress();
+void applyDutyFromSequence();
+
+// cyclic executive
+typedef void (*TaskFn)();
+TaskFn tasks[] = { taskSerial, taskLED1, taskLED2, taskButton };
+const uint8_t NUM_TASKS = sizeof(tasks) / sizeof(tasks[0]);
+
+// timer2 overflow ISR, software PWM 
+// timer2 in normal mode means prescaler = 64 
+// If pwmCounter < pwmDuty MOTOR_PIN is HIGH
+// otherwise MOTOR_PIN is LOW
+ISR(TIMER2_OVF_vect) {
+  pwmCounter++;  // wraps at 255 automatically
+
+  if (pwmCounter < pwmDuty) {
+    // MOTOR_PIN = 3 is PD3 on ATmega328p
+    PORTD |= _BV(PORTD3);    // HIGH
+  } else {
+    PORTD &= ~_BV(PORTD3);   // LOW
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  // project 2 LEDs
+  pinMode(8, OUTPUT);
+  pinMode(9, OUTPUT);
+
+  // New motor + button
+  pinMode(MOTOR_PIN, OUTPUT);
+  digitalWrite(MOTOR_PIN, LOW);
+  pinMode(BUTTON_PIN, INPUT_PULLUP); // active LOW button
+
+  // from project 2
+  Serial.println("What LED? (1-2)");
+  Serial.println("Motor control ready. Initial state: motor is off");
+
+  // Configure Timer2 for software PWM
+  setupTimer2ForSoftwarePWM();
+
+  
+  sei();
+}
+
+// set up timer 2 for pwm
+void setupTimer2ForSoftwarePWM() {
+  // Stop Timer2
+  TCCR2A = 0;
+  TCCR2B = 0;
+
+  // Normal mode WGM22:0 = 0
+  // already 0 from above
+
+  // Prescaler 
+  TCCR2B |= _BV(CS22);   // CS22 = 1, CS21 = 0, CS20 = 0
+
+  // Enable overflow interrupt
+  TIMSK2 |= _BV(TOIE2);
+}
+
+// cyclic executive loop
+void loop() {
+  static uint8_t rr = 0;
+  tasks[rr]();                    // run one task per tick
+  rr = (rr + 1) % NUM_TASKS;     // next task
+}
+
+// code from Project 2, independent LED blinking
+void taskSerial() {
+  if (waitingForInput) {
+    if (Serial.available() > 0) {
+      String strInput = Serial.readStringUntil('\n');
+      int userInput = strInput.toInt();
+      if (userInput == 1 || userInput == 2) {
+        currentLED = userInput;
+        Serial.println("What Interval? (msec)");
+        waitingForInput = false;
+      } else {
+        Serial.println("Invalid Input. Please choose between LED 1 or 2.");
+      }
+    }
+  } else {
+    if (Serial.available() > 0) {
+      String strDelayInput = Serial.readStringUntil('\n');
+      int delayInput = strDelayInput.toInt();
+      if (delayInput > 0) {
+        if (currentLED == 1) {
+          intervalLED1 = delayInput;
+          Serial.println("Interval set for LED 1.");
+        } else if (currentLED == 2) {
+          intervalLED2 = delayInput;
+          Serial.println("Interval set for LED 2.");
+        }
+        Serial.println("What LED? (1-2)");
+        waitingForInput = true;
+      } else {
+        Serial.println("Invalid Interval. Please ensure your interval is in ms.");
+      }
+    }
+  }
+}
+
+// LED 1
+void taskLED1() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillisLED1 >= (unsigned long)intervalLED1) {
+    previousMillisLED1 = currentMillis;
+    led1State = !led1State;
+    digitalWrite(8, led1State ? HIGH : LOW);
+  }
+}
+
+// LED 2
+void taskLED2() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillisLED2 >= (unsigned long)intervalLED2) {
+    previousMillisLED2 = currentMillis;
+    led2State = !led2State;
+    digitalWrite(9, led2State ? HIGH : LOW);
+  }
+}
+
+// button and motor
+void taskButton() {
+  // Run debouncing at a limited rate using millis()
+  static unsigned long lastSampleMs = 0;
+  unsigned long now = millis();
+
+  if (now - lastSampleMs < 5) {
+    return; // only sample about every 5ms
+  }
+  lastSampleMs = now;
+
+  bool rawPressed = (digitalRead(BUTTON_PIN) == LOW); // active LOW
+
+  // detect a button press
+  if (rawPressed != btnLastRawPressed) {
+    btnLastRawPressed = rawPressed;
+    btnLastChangeMs   = now;  // start debounce timer
+  }
+
+  // if stable longer than debounce interval then accept it
+  if (now - btnLastChangeMs >= DEBOUNCE_MS) {
+    if (rawPressed != btnStablePressed) {
+      // Debounced state changed
+      btnStablePressed = rawPressed;
+
+      // only care about button being pressed down
+      if (btnStablePressed) {
+        handleDebouncedButtonPress();
+      }
+    }
+  }
+}
+
+// handle a press
+void handleDebouncedButtonPress() {
+  // Advance sequence index 0..8 and wrap
+  currentSeqPos = (currentSeqPos + 1) % 9;
+  applyDutyFromSequence();
+}
+
+// update pwmDuty and print Serial message 
+void applyDutyFromSequence() {
+  uint8_t levelIndex = dutyLevelIndexSeq[currentSeqPos]; // 0..4
+
+  // set duty used in Timer2 ISR 
+  pwmDuty = dutyLevels[levelIndex];
+
+  // messages
+  if (levelIndex == 0) {
+    Serial.println("motor is off");
+  } else {
+    uint8_t numerator = 2 * levelIndex; // 2, 4, 6, or 8
+    Serial.print("Motor operates at ");
+    Serial.print(numerator);
+    Serial.println("/8 duty cycle");
+  }
+}
